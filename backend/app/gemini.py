@@ -1,0 +1,330 @@
+"""Gemini vision call: compare BEFORE/AFTER tray photos against the known served menu.
+
+Order of attempts: primary model -> fallback model -> cached response for identical photos.
+In mock mode (no API key, or NOURISH_MODE=mock) a deterministic fake estimate is returned.
+"""
+import hashlib
+import json
+import logging
+
+from google import genai
+from google.genai import types
+from pydantic import BaseModel, Field
+
+from . import config
+from .schemas import TrayAnalysis, ImageQuality, Confidence
+
+log = logging.getLogger("nourish.gemini")
+
+PROMPT = """You are assisting nursing staff in a long-term care facility by estimating meal intake.
+Accuracy matters: these estimates are used to spot residents who are not eating enough.
+
+You get two photos of the SAME meal tray:
+  Photo 1 = BEFORE the resident ate.
+  Photo 2 = AFTER the resident ate.
+
+The kitchen says these items were served (id: name, food group):
+{menu}
+
+Work in this order:
+
+1. INVENTORY. Look only at BEFORE. In before_inventory, list every food, drink and condiment
+   you can see and where it is (e.g. "scrambled eggs, left compartment, about 1 cup").
+   The kitchen list can be wrong. Trust the photo, not the list.
+
+2. MATCH. For each served id, decide if it is actually in BEFORE.
+   - Match by appearance, not exact wording (e.g. "Sliced banana" matches banana pieces).
+   - If it is NOT in BEFORE: visible_in_before=false, percent_eaten=0, confidence=low.
+     Do not guess an amount for food that was never there.
+
+3. COMPARE. For each item that is present, describe it in BEFORE and in AFTER, then estimate
+   percent_eaten = portion gone. Use the same item in both photos as its own reference:
+     0   = untouched, same size and shape
+     10  = one or two bites gone
+     25  = about a quarter gone
+     50  = about half gone, plate visible under the food
+     75  = only a small amount left
+     90  = scraps or smears only
+     100 = nothing left
+   Use multiples of 5.
+   - Liquids: compare the fill line in the cup, not the cup itself.
+   - Food pushed around, spread out or mashed is NOT eaten. Spread-out food looks larger
+     than it is; judge by the amount, not the area it covers.
+   - Hidden food (under a napkin or lid, or out of frame) is NOT eaten: lower confidence instead.
+   - Empty wrappers, peels and bones are leftovers, not food.
+   - confidence=high only when the item is clearly visible in both photos.
+
+4. EXTRAS. Every food, drink or condiment in BEFORE that is not in the served list goes in
+   extra_items with its own percent_eaten (salt packets and sauces count).
+
+Also report same_tray (false if the photos clearly show different trays), image quality for
+each photo, and notes (one or two short factual sentences about what was left).
+
+Describe only what is visible. Do not give medical advice or diagnoses.
+Return one entry in "items" for every served id, using exactly those ids."""
+
+BEFORE_PROMPT = """You are assisting nursing staff in a long-term care facility.
+You are given a single photo of a meal tray BEFORE the resident eats.
+
+The kitchen says these items were served (id: name, food group):
+{menu}
+
+1. INVENTORY. List every food, drink and condiment you can see and where it is.
+2. MATCH. For each served id, decide if it is actually visible in the photo.
+   - Match by appearance, not exact wording.
+   - Set visible=true if you can see it, false if you cannot.
+3. EXTRAS. Every food, drink or condiment visible that is NOT in the served list goes in extra_items.
+
+Also report image quality.
+Describe only what is visible. Do not give medical advice or diagnoses.
+Return one entry in "items" for every served id, using exactly those ids."""
+
+
+class BeforeItemCheck(BaseModel):
+    menu_item_id: int
+    visible: bool
+    description: str = Field(description="Short description of what you see, or 'not visible'")
+    confidence: Confidence = Field(description="How confident are you this item is visible: high, medium, or low")
+
+
+class BeforeCheck(BaseModel):
+    inventory: str = Field(description="List every food/drink/condiment visible and its position")
+    quality: ImageQuality
+    items: list[BeforeItemCheck]
+    extra_items: list[str] = Field(description="Names of foods visible but not on the served list")
+
+
+_client: genai.Client | None = None
+
+
+class AnalysisUnavailable(RuntimeError):
+    pass
+
+
+def _get_client() -> genai.Client:
+    global _client
+    if _client is None:
+        _client = genai.Client(api_key=config.GEMINI_API_KEY)
+    return _client
+
+
+def _cache_key(meal_id: int, before: bytes, after: bytes) -> str:
+    h = hashlib.sha256()
+    for part in (str(meal_id).encode(), before, after):
+        h.update(hashlib.sha256(part).digest())
+    return h.hexdigest()
+
+
+def _cache_read(key: str) -> TrayAnalysis | None:
+    path = config.CACHE_DIR / f"{key}.json"
+    if not path.exists():
+        return None
+    try:
+        return TrayAnalysis.model_validate_json(path.read_text())
+    except ValueError:  # cached with an older schema
+        return None
+
+
+def _cache_write(key: str, analysis: TrayAnalysis) -> None:
+    config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    (config.CACHE_DIR / f"{key}.json").write_text(analysis.model_dump_json(indent=2))
+
+
+def _mock(items: list[dict]) -> TrayAnalysis:
+    """Deterministic, varied fake estimates so the UI can be built offline."""
+    pattern = [25, 80, 50, 100, 10, 65]
+    return TrayAnalysis(
+        before_inventory="(mock) Gemini was not called.",
+        same_tray=True,
+        before_quality="ok",
+        after_quality="ok",
+        items=[
+            {
+                "menu_item_id": it["id"],
+                "visible_in_before": True,
+                "before_description": f"(mock) full portion of {it['name']}",
+                "after_description": "(mock) partly eaten",
+                "percent_eaten": pattern[(it["id"] + i) % len(pattern)],
+                "confidence": "low" if i == 0 else "high",
+                "observation": f"(mock) {it['name']} partially eaten.",
+            }
+            for i, it in enumerate(items)
+        ],
+        extra_items=[],
+        notes="Mock analysis: Gemini was not called.",
+    )
+
+
+async def _call(model: str, prompt: str, before: bytes, after: bytes) -> TrayAnalysis:
+    resp = await _get_client().aio.models.generate_content(
+        model=model,
+        contents=[
+            prompt,
+            "Photo 1 (BEFORE):",
+            types.Part.from_bytes(data=before, mime_type="image/jpeg"),
+            "Photo 2 (AFTER):",
+            types.Part.from_bytes(data=after, mime_type="image/jpeg"),
+        ],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=TrayAnalysis,
+            temperature=0,
+            # More image tokens so small leftovers are visible to the model.
+            media_resolution=types.MediaResolution.MEDIA_RESOLUTION_HIGH,
+            # Let the model reason through the BEFORE/AFTER comparison before answering.
+            thinking_config=types.ThinkingConfig(thinking_level=config.GEMINI_THINKING_LEVEL),
+        ),
+    )
+    if isinstance(resp.parsed, TrayAnalysis):
+        return resp.parsed
+    if not resp.text:
+        raise AnalysisUnavailable("empty response from Gemini")
+    return TrayAnalysis.model_validate(json.loads(resp.text))
+
+
+async def analyze_tray(
+    meal_id: int, items: list[dict], before: bytes, after: bytes
+) -> tuple[TrayAnalysis, str, str]:
+    """Returns (analysis, source, model). source is gemini | cache | mock."""
+    if config.MODE == "mock":
+        return _mock(items), "mock", "mock"
+
+    key = _cache_key(meal_id, before, after)
+    menu = "\n".join(f"  {it['id']}: {it['name']} ({it['food_group']})" for it in items)
+    prompt = PROMPT.format(menu=menu)
+
+    errors = []
+    for model in dict.fromkeys([config.GEMINI_MODEL, config.GEMINI_FALLBACK_MODEL]):
+        try:
+            analysis = await _call(model, prompt, before, after)
+            _cache_write(key, analysis)
+            return analysis, "gemini", model
+        except Exception as e:  # rate limit, network, bad JSON: try next option
+            log.warning("Gemini model %s failed: %s", model, e)
+            errors.append(f"{model}: {type(e).__name__}")
+
+    cached = _cache_read(key)
+    if cached is not None:
+        return cached, "cache", "cache"
+    raise AnalysisUnavailable("; ".join(errors))
+
+
+HEALTH_PROMPT = """You are assisting nursing-home care staff by reviewing a resident's
+30-day nutrition summary. You are NOT giving a diagnosis — you flag patterns that a
+doctor or dietitian should review, and suggest practical next steps.
+
+Resident profile:
+{profile}
+
+30-day average daily intake (meals + supplements) vs recommended target range:
+{nutrients}
+
+Other signals:
+{signals}
+
+Based ONLY on the nutrient patterns and profile above, produce a JSON object with:
+- "flags": a list of conditions worth a doctor's check, each with:
+    - "condition": one of Osteoporosis, Sarcopenia, Anemia, Type 2 Diabetes,
+      Cardiovascular Disease, Malnutrition, Vitamin D deficiency, Vitamin B12 deficiency,
+      Dehydration, or another relevant nutrition-linked condition
+    - "severity": "high" or "medium"
+    - "reason": one or two plain sentences linking the nutrient pattern to the concern
+- "recommendations": a list of concrete next steps, each with:
+    - "action": short imperative (e.g. "Order a serum ferritin test", "Add iron-rich foods")
+    - "detail": one sentence explaining the action
+- "menu_suggestions": a list of specific foods that would raise the most deficient nutrients
+- "summary": two or three sentences a nurse could read at shift handoff
+
+Be specific and link every flag to the data. Do not invent lab values. This is decision
+support for staff, not a medical diagnosis."""
+
+
+class HealthFlag(BaseModel):
+    condition: str
+    severity: str
+    reason: str
+
+
+class HealthRecommendation(BaseModel):
+    action: str
+    detail: str
+
+
+class HealthAssessment(BaseModel):
+    flags: list[HealthFlag]
+    recommendations: list[HealthRecommendation]
+    menu_suggestions: list[str]
+    summary: str
+
+
+async def assess_health(profile: str, nutrients: str, signals: str) -> HealthAssessment:
+    """Gemini-generated health review from the 30-day nutrition summary."""
+    if config.MODE == "mock":
+        return HealthAssessment(
+            flags=[HealthFlag(condition="Anemia", severity="medium",
+                              reason="(mock) Average iron intake is below the recommended minimum.")],
+            recommendations=[HealthRecommendation(action="Review with doctor",
+                                                  detail="(mock) Consider a serum ferritin test.")],
+            menu_suggestions=["Minced beef with gravy", "Spinach (creamed)"],
+            summary="(mock) Gemini was not called. This is placeholder decision-support text.",
+        )
+
+    prompt = HEALTH_PROMPT.format(profile=profile, nutrients=nutrients, signals=signals)
+    errors = []
+    for model in dict.fromkeys([config.GEMINI_MODEL, config.GEMINI_FALLBACK_MODEL]):
+        try:
+            resp = await _get_client().aio.models.generate_content(
+                model=model,
+                contents=[prompt],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=HealthAssessment,
+                    temperature=0.2,
+                    thinking_config=types.ThinkingConfig(thinking_level=config.GEMINI_THINKING_LEVEL),
+                ),
+            )
+            if isinstance(resp.parsed, HealthAssessment):
+                return resp.parsed
+            return HealthAssessment.model_validate(json.loads(resp.text))
+        except Exception as e:
+            log.warning("Gemini health assessment model %s failed: %s", model, e)
+            errors.append(f"{model}: {type(e).__name__}")
+    raise AnalysisUnavailable("; ".join(errors))
+
+
+async def check_before_tray(items: list[dict], before: bytes) -> BeforeCheck:
+    """Analyse just the before photo: what's visible, what's missing, what's extra.
+    Returns a mock result when NOURISH_MODE=mock."""
+    if config.MODE == "mock":
+        return BeforeCheck(
+            inventory="(mock) Full tray visible.",
+            quality=ImageQuality.ok,
+            items=[BeforeItemCheck(menu_item_id=it["id"], visible=True, confidence=Confidence.high, description=f"(mock) {it['name']} present") for it in items],
+            extra_items=[],
+        )
+
+    menu = "\n".join(f"  {it['id']}: {it['name']} ({it['food_group']})" for it in items)
+    prompt = BEFORE_PROMPT.format(menu=menu)
+
+    errors = []
+    for model in dict.fromkeys([config.GEMINI_MODEL, config.GEMINI_FALLBACK_MODEL]):
+        try:
+            resp = await _get_client().aio.models.generate_content(
+                model=model,
+                contents=[prompt, "Tray photo (BEFORE):", types.Part.from_bytes(data=before, mime_type="image/jpeg")],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=BeforeCheck,
+                    temperature=0,
+                    media_resolution=types.MediaResolution.MEDIA_RESOLUTION_HIGH,
+                    thinking_config=types.ThinkingConfig(thinking_level=config.GEMINI_THINKING_LEVEL),
+                ),
+            )
+            if isinstance(resp.parsed, BeforeCheck):
+                return resp.parsed
+            return BeforeCheck.model_validate(json.loads(resp.text))
+        except Exception as e:
+            log.warning("Gemini before-check model %s failed: %s", model, e)
+            errors.append(f"{model}: {type(e).__name__}")
+
+    raise AnalysisUnavailable("; ".join(errors))
